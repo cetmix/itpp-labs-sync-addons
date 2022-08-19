@@ -17,9 +17,7 @@
         <field name="model">sync.task</field>
         <field name="arch" type="xml">
             <form>
-                <header>
-
-                </header>
+                <header />
                 <sheet>
                     <div class="oe_button_box" name="button_box">
                         <!-- Delete in Odoo 13 -->
@@ -63,7 +61,10 @@
                     </div>
                     <group>
                         <group>
-                            <field name="project_id" invisible="1" />
+                            <field
+                                name="project_id"
+                                domain="['|',('active', '=', True),('active', '=', False)]"
+                            />
                         </group>
                     </group>
                     <notebook>
@@ -175,6 +176,16 @@
             </xpath>
         </field>
     </record>
+    <record id="sync_task_line_search" model="ir.ui.view">
+        <field name="name">sync.task.search</field>
+        <field name="model">sync.task</field>
+        <field name="arch" type="xml">
+            <search string="Sync Task">
+                <field name="name" />
+                <field name="project_id" />
+            </search>
+        </field>
+    </record>
     <record id="sync_task_action_from_project" model="ir.actions.act_window">
         <field name="name">Tasks</field>
         <field name="res_model">sync.task</field>
@@ -184,4 +195,17 @@
             {'default_project_id': active_id, 'active_test': False}
         </field>
     </record>
+    <record id="sync_task_action" model="ir.actions.act_window">
+        <field name="name">Sync Tasks</field>
+        <field name="res_model">sync.task</field>
+        <field name="view_mode">tree,form</field>
+        <field name="domain" />
+    </record>
+    <menuitem
+        id="sync_task_menu_action"
+        name="Sync Tasks"
+        parent="sync_menu"
+        action="sync_task_action"
+        sequence="40"
+    />
 </odoo>
