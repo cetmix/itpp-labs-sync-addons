@@ -31,9 +31,9 @@
         "views/sync_link_views.xml",
         "wizard/sync_make_module_views.xml",
         "data/queue_job_function_data.xml",
+        "data/sync_project_context_demo.xml",
     ],
     "demo": [
-        "data/sync_project_context_demo.xml",
         "data/sync_project_telegram_demo.xml",
         "data/sync_project_odoo2odoo_demo.xml",
         "data/sync_project_trello_github_demo.xml",
