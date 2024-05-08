@@ -6,3 +6,4 @@ swagger_spec_validator
 pyTelegramBotAPI
 viberbot
 markdown==3.6
+pyyaml
