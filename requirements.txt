@@ -2,4 +2,5 @@
 bravado_core
 jsonschema<4
 markdown
+pyyaml
 swagger_spec_validator
