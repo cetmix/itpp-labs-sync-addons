@@ -1,5 +1,5 @@
 [![help@itpp.dev](https://itpp.dev/images/infinity-readme.png)](mailto:help@itpp.dev)
-# [16.0] Odoo Integration Modules
+# [16.0] odoomagic.com
 
 :open_file_folder: Get a **.zip** file with all needed dependencies:
 
