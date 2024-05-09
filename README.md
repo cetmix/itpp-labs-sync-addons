@@ -1,6 +1,6 @@
 <h1 align="center">¡Welcome!</h1>
 
-<p align="center"> <b>Sync 🪬 Studio</b> is a groundbreaking meta-application<br/>that empowers you to build connectors in just a few hours. </p>
+<p align="center"> <b>Sync 🪬 Studio</b> is a groundbreaking meta-application<br/>that empowers you to build <b>Odoo ✨ Connectors</b> in just a few hours. </p>
 
 <div align="center">
 <a target="_blank" href="https://odoomagic.com/"><img src="https://github.com/itpp-labs/sync-addons/assets/186131/b7ae8ced-44f4-498d-b111-2fc4e3d1171b" alt="Sync 🪬 Studio"/></a>
