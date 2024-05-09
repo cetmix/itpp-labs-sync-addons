@@ -26,14 +26,15 @@ class SyncTask(models.Model):
     code = fields.Text("Code")
     code_check = fields.Text("Syntax check", store=False, readonly=True)
     active = fields.Boolean(default=True)
+    magic_button = fields.Char()
+    button_ids = fields.One2many(
+        "sync.trigger.button", "sync_task_id", string="Manual Triggers", copy=True
+    )
     cron_ids = fields.One2many("sync.trigger.cron", "sync_task_id", copy=True)
     automation_ids = fields.One2many(
         "sync.trigger.automation", "sync_task_id", copy=True
     )
     webhook_ids = fields.One2many("sync.trigger.webhook", "sync_task_id", copy=True)
-    button_ids = fields.One2many(
-        "sync.trigger.button", "sync_task_id", string="Manual Triggers", copy=True
-    )
     active_cron_ids = fields.Many2many(
         "sync.trigger.cron",
         string="Enabled Crons",
@@ -49,12 +50,6 @@ class SyncTask(models.Model):
     active_webhook_ids = fields.Many2many(
         "sync.trigger.webhook",
         string="Enabled Webhooks",
-        compute="_compute_active_triggers",
-        context={"active_test": False},
-    )
-    active_button_ids = fields.Many2many(
-        "sync.trigger.button",
-        string="Enabled Buttons",
         compute="_compute_active_triggers",
         context={"active_test": False},
     )
@@ -92,14 +87,24 @@ class SyncTask(models.Model):
         "cron_ids.active",
         "automation_ids.active",
         "webhook_ids.active",
-        "button_ids.active",
     )
     def _compute_active_triggers(self):
         for r in self.with_context(active_test=False):
             r.active_cron_ids = r.with_context(active_test=True).cron_ids
             r.active_automation_ids = r.with_context(active_test=True).automation_ids
             r.active_webhook_ids = r.with_context(active_test=True).webhook_ids
-            r.active_button_ids = r.with_context(active_test=True).button_ids
+
+    def action_magic_button(self):
+        # TODO: This should be refactored to delete button_ids
+        if not self.button_ids:
+            self.button_ids.create(
+                {
+                    "name": self.magic_button,
+                    "trigger_name": self.magic_button,
+                    "sync_task_id": self.id,
+                }
+            )
+        return self.button_ids.start_button()
 
     def start(
         self, trigger, args=None, with_delay=False, force=False, raise_on_error=True

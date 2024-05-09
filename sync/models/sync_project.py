@@ -1,19 +1,20 @@
-# Copyright 2020,2022 Ivan Yelizariev <https://twitter.com/yelizariev>
+# Copyright 2020,2022,2024 Ivan Yelizariev <https://twitter.com/yelizariev>
 # Copyright 2020-2021 Denis Mudarisov <https://github.com/trojikman>
 # Copyright 2021 Ilya Ilchenko <https://github.com/mentalko>
 # License MIT (https://opensource.org/licenses/MIT).
 
 import base64
 import logging
+from datetime import datetime
 
 from pytz import timezone
 
 from odoo import api, fields, models
-from odoo.exceptions import UserError, ValidationError
-from odoo.tools import DEFAULT_SERVER_DATETIME_FORMAT, frozendict, html2plaintext
+from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.tools import DEFAULT_SERVER_DATETIME_FORMAT, html2plaintext
 from odoo.tools.misc import get_lang
 from odoo.tools.safe_eval import (
-    datetime,
+    datetime as safe_datetime,
     dateutil,
     json,
     safe_eval,
@@ -24,18 +25,35 @@ from odoo.tools.translate import _
 
 from odoo.addons.queue_job.exception import RetryableJobError
 
-from ..tools import url2base64, url2bin
+from ..lib.tools.safe_eval import safe_eval__MAGIC, test_python_expr__MAGIC
+from ..tools import (
+    AttrDict,
+    add_items,
+    compile_markdown_to_html,
+    convert_python_front_matter_to_comment,
+    extract_yaml_from_markdown,
+    extract_yaml_from_python,
+    fetch_gist_data,
+    has_function_defined,
+    url2base64,
+    url2bin,
+)
 from .ir_logging import LOG_CRITICAL, LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_WARNING
 
 _logger = logging.getLogger(__name__)
 DEFAULT_LOG_NAME = "Log"
 
 
-def cleanup_eval_context(eval_context):
-    delete = [k for k in eval_context if k.startswith("_")]
-    for k in delete:
-        del eval_context[k]
-    return eval_context
+def eval_export(eval_function, code, eval_context):
+    EXPORT = {}
+
+    def export(*args, **kwargs):
+        # Используем общую функцию для добавления элементов в EXPORT
+        add_items(EXPORT, *args, **kwargs)
+
+    eval_context = dict(eval_context, export=export)
+    eval_function((code or "").strip(), eval_context, mode="exec", nocopy=True)
+    return AttrDict(EXPORT)
 
 
 class SyncProject(models.Model):
@@ -44,28 +62,34 @@ class SyncProject(models.Model):
     _description = "Sync Project"
 
     name = fields.Char(
-        "Name", help="e.g. Legacy Migration or eCommerce Synchronization", required=True
+        "Name",
+        help="e.g. Legacy Migration or eCommerce Integration",
     )
     active = fields.Boolean(default=False)
-    # Deprecated, please use eval_context_ids
-    # TODO: delete in v17 release
-    eval_context = fields.Selection([], string="Evaluation context")
-    eval_context_ids = fields.Many2many(
-        "sync.project.context", string="Evaluation contexts"
-    )
-    eval_context_description = fields.Text(compute="_compute_eval_context_description")
 
-    common_code = fields.Text(
-        "Common Code",
-        help="""
-        A place for helpers and constants.
-
-        You can add here a function or variable, that don't start with underscore and then reuse it in task's code.
-    """,
+    source_url = fields.Char(
+        "Source",
+        help="Paste link to gist page, e.g. https://gist.github.com/yelizariev/e0585a0817c4d87b65b8a3d945da7ca2",
     )
-    param_ids = fields.One2many("sync.project.param", "project_id", copy=True)
-    text_param_ids = fields.One2many("sync.project.text", "project_id", copy=True)
+    source_updated_at = fields.Datetime("Version", readonly=True)
+    description = fields.Html(readonly=True)
+
+    core_code = fields.Text(string="Core Code", readonly=True)
+    common_code = fields.Text("Project Library Code")
+
+    param_ids = fields.One2many(
+        "sync.project.param", "project_id", copy=True, string="Parameters"
+    )
+    param_description = fields.Html(readonly=True)
+
+    text_param_ids = fields.One2many(
+        "sync.project.text", "project_id", copy=True, string="Templates"
+    )
+    text_param_description = fields.Html(readonly=True)
+
     secret_ids = fields.One2many("sync.project.secret", "project_id", copy=True)
+    secret_description = fields.Html(readonly=True)
+
     task_ids = fields.One2many("sync.task", "project_id", copy=True)
     task_count = fields.Integer(compute="_compute_task_count")
     trigger_cron_count = fields.Integer(
@@ -76,12 +100,6 @@ class SyncProject(models.Model):
     )
     trigger_webhook_count = fields.Integer(
         compute="_compute_triggers", help="Enabled Webhooks"
-    )
-    trigger_button_count = fields.Integer(
-        compute="_compute_triggers", help="Manual Triggers"
-    )
-    trigger_button_ids = fields.Many2many(
-        "sync.trigger.button", compute="_compute_triggers", string="Manual Triggers"
     )
     job_ids = fields.One2many("sync.job", "project_id")
     job_count = fields.Integer(compute="_compute_job_count")
@@ -96,18 +114,6 @@ class SyncProject(models.Model):
     def unlink(self):
         self.with_context(active_test=False).mapped("task_ids").unlink()
         return super().unlink()
-
-    def _compute_eval_context_description(self):
-        for r in self:
-            r.eval_context_description = (
-                "\n".join(
-                    r.eval_context_ids.mapped(
-                        lambda c: "-= " + c.display_name + " =-\n\n" + c.description
-                    )
-                )
-                if r.eval_context_ids
-                else ""
-            )
 
     def _compute_network_access_readonly(self):
         for r in self:
@@ -133,15 +139,28 @@ class SyncProject(models.Model):
             r.trigger_cron_count = len(r.mapped("task_ids.cron_ids"))
             r.trigger_automation_count = len(r.mapped("task_ids.automation_ids"))
             r.trigger_webhook_count = len(r.mapped("task_ids.webhook_ids"))
-            r.trigger_button_count = len(r.mapped("task_ids.button_ids"))
-            r.trigger_button_ids = r.mapped("task_ids.button_ids")
 
     @api.constrains("common_code")
-    def _check_python_code(self):
+    def _check_python_common_code(self):
         for r in self.sudo().filtered("common_code"):
             msg = test_python_expr(expr=(r.common_code or "").strip(), mode="exec")
             if msg:
                 raise ValidationError(msg)
+
+    @api.constrains("core_code")
+    def _check_python_core_code(self):
+        for r in self.sudo().filtered("core_code"):
+            msg = test_python_expr__MAGIC(expr=(r.core_code or "").strip(), mode="exec")
+            if msg:
+                raise ValidationError(msg)
+
+    def write(self, vals):
+        if "core_code" in vals and not self.env.user.has_group(
+            "sync.sync_group_manager"
+        ):
+            raise AccessError(_("Only Administrator can update the Core Code."))
+
+        return super().write(vals)
 
     def _get_log_function(self, job, function):
         self.ensure_one()
@@ -176,10 +195,9 @@ class SyncProject(models.Model):
         return log
 
     def _get_eval_context(self, job, log):
-        """Executed Secret and Common codes and return "exported" variables and functions"""
+        """Prepare Task Evaluation Context"""
         self.ensure_one()
-        log("Job started", LOG_DEBUG)
-        start_time = time.time()
+        log("Let's prepare Evaluation Context", LOG_DEBUG)
 
         def add_job(function, **options):
             if callable(function):
@@ -201,18 +219,6 @@ class SyncProject(models.Model):
 
             return f
 
-        params = AttrDict()
-        for p in self.param_ids:
-            params[p.key] = p.value
-
-        texts = AttrDict()
-        for p in self.text_param_ids:
-            texts[p.key] = p.value
-
-        webhooks = AttrDict()
-        for w in self.task_ids.mapped("webhook_ids"):
-            webhooks[w.trigger_name] = w.website_url
-
         def log_transmission(recipient_str, data_str):
             log(data_str, name=recipient_str, log_type="data_out")
 
@@ -229,11 +235,7 @@ class SyncProject(models.Model):
         def type2str(obj):
             return "%s" % type(obj)
 
-        def record2image(record, fname=None):
-            # TODO: implement test, that is useful for backporting to 12.0
-            if not fname:
-                fname = "image_1920"
-
+        def record2image(record, fname="image_1920"):
             return (
                 record.sudo()
                 .env["ir.attachment"]
@@ -250,7 +252,7 @@ class SyncProject(models.Model):
         context = dict(self.env.context, log_function=log)
         env = self.env(context=context)
         link_functions = env["sync.link"]._get_eval_context()
-        eval_context = dict(
+        MAGIC = AttrDict(
             **link_functions,
             **self._get_sync_functions(log, link_functions),
             **{
@@ -262,9 +264,6 @@ class SyncProject(models.Model):
                 "LOG_WARNING": LOG_WARNING,
                 "LOG_ERROR": LOG_ERROR,
                 "LOG_CRITICAL": LOG_CRITICAL,
-                "params": params,
-                "texts": texts,
-                "webhooks": webhooks,
                 "user": self.env.user,
                 "trigger": job.trigger_name,
                 "add_job": add_job,
@@ -280,7 +279,7 @@ class SyncProject(models.Model):
                 "url2bin": url2bin,
                 "html2plaintext": html2plaintext,
                 "time": time,
-                "datetime": datetime,
+                "datetime": safe_datetime,
                 "dateutil": dateutil,
                 "timezone": timezone,
                 "b64encode": base64.b64encode,
@@ -288,39 +287,48 @@ class SyncProject(models.Model):
                 "type2str": type2str,
                 "record2image": record2image,
                 "DEFAULT_SERVER_DATETIME_FORMAT": DEFAULT_SERVER_DATETIME_FORMAT,
-            }
+                "AttrDict": AttrDict,
+            },
         )
-        reading_time = time.time() - start_time
+        SECRETS = AttrDict()
+        for p in self.secret_ids:
+            SECRETS[p.key] = p.value
 
-        executing_custom_context = 0
-        if self.eval_context_ids:
-            start_time = time.time()
+        PARAMS = AttrDict()
+        for p in self.param_ids:
+            PARAMS[p.key] = p.value
 
-            secrets = AttrDict()
-            for p in self.sudo().secret_ids:
-                secrets[p.key] = p.value
-            eval_context_frozen = frozendict(eval_context)
-            for ec in self.eval_context_ids:
-                method = ec.get_eval_context_method()
-                eval_context = dict(
-                    **eval_context, **method(secrets, eval_context_frozen)
+        for p in self.text_param_ids:
+            if p.key in PARAMS:
+                raise ValidationError(
+                    _(
+                        "Project Templates and Settings should not have parameters with the same key: %s"
+                    )
+                    % p.key
                 )
-            cleanup_eval_context(eval_context)
+            PARAMS[p.key] = p.value
 
-            executing_custom_context = time.time() - start_time
+        WEBHOOKS = AttrDict()
+        for w in self.task_ids.mapped("webhook_ids"):
+            WEBHOOKS[w.trigger_name] = w.website_url
 
-        start_time = time.time()
-        safe_eval(
-            (self.common_code or "").strip(), eval_context, mode="exec", nocopy=True
-        )
-        executing_common_code = time.time() - start_time
-        log(
-            "Evalution context is prepared. Reading project data: %05.3f sec; preparing custom evalution context: %05.3f sec; Executing Common Code: %05.3f sec"
-            % (reading_time, executing_custom_context, executing_common_code),
-            LOG_DEBUG,
-        )
-        cleanup_eval_context(eval_context)
-        return eval_context
+        core_eval_context = {
+            "MAGIC": MAGIC,
+            "SECRETS": SECRETS,
+        }
+        CORE = eval_export(safe_eval__MAGIC, self.core_code, core_eval_context)
+
+        lib_eval_context = {
+            "MAGIC": MAGIC,
+            "CORE": CORE,
+            "PARAMS": PARAMS,
+            "WEBHOOKS": WEBHOOKS,
+        }
+        LIB = eval_export(safe_eval, self.common_code, lib_eval_context)
+
+        task_eval_context = dict(lib_eval_context, LIB=LIB)
+        log("Evaluation Context is ready!", LOG_DEBUG)
+        return task_eval_context
 
     def _get_sync_functions(self, log, link_functions):
         def _sync(src_list, src2dst, link_src_dst, create=None, update=None):
@@ -388,10 +396,6 @@ class SyncProject(models.Model):
                 update and sync_info["odoo"]["update"],
             )
 
-        # def sync_x2y(src_list, sync_info, create=False, update=False):
-        #     return sync_external(src_list, sync_info["relation"], sync_info["x"], sync_info["y"], create=create, update=update)
-        # def sync_y2x(src_list, sync_info, create=False, update=False):
-        #     return sync_external(src_list, sync_info["relation"], sync_info["y"], sync_info["x"], create=create, update=update)
         def sync_external(
             src_list, relation, src_info, dst_info, create=False, update=False
         ):
@@ -427,6 +431,131 @@ class SyncProject(models.Model):
             "sync_external": sync_external,
         }
 
+    def magic_upgrade(self):
+        self.ensure_one()
+        if not self.source_url:
+            raise UserError(_("Please provide url to the gist page"))
+
+        gist_content = fetch_gist_data(self.source_url)
+        gist_id = gist_content["id"]
+        gist_files = {}
+        for file_name, file_info in gist_content["files"].items():
+            gist_files[file_name] = file_info["content"]
+
+        vals = {}
+
+        if not self.name:
+            vals["name"] = gist_content.get("description", "Sync 🪬 Studio")
+
+        vals["source_updated_at"] = datetime.strptime(
+            gist_content.get("updated_at"), "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        # [Documentation]
+        vals["description"] = (
+            compile_markdown_to_html(gist_files.get("README.md"))
+            if gist_files.get("README.md")
+            else "<h1>Please add README.md file to place some documentation here</h1>"
+        )
+
+        # [PARAMS] and [SECRETS]
+        for model, field_name, file_name in (
+            ("sync.project.param", "param_description", "settings.markdown"),
+            (
+                "sync.project.text",
+                "text_param_description",
+                "settings.templates.markdown",
+            ),
+            ("sync.project.secret", "secret_description", "settings.secrets.markdown"),
+        ):
+            file_content = gist_files.get(file_name)
+            if not file_content:
+                continue
+            vals[field_name] = compile_markdown_to_html(file_content)
+            meta = extract_yaml_from_markdown(file_content)
+
+            for key, initial_value in meta.items():
+                param_vals = {
+                    "key": key,
+                    "initial_value": initial_value,
+                    "project_id": self.id,
+                }
+                self.env[model]._create_or_update_by_xmlid(
+                    param_vals, f"PARAM_{key}", namespace=gist_id
+                )
+
+        # [CORE] and [LIB]
+        for field_name, file_name in (
+            ("core_code", "core.py"),
+            ("common_code", "library.py"),
+        ):
+            if gist_files.get(file_name):
+                vals[field_name] = gist_files[file_name]
+
+        # Tasks 🦋
+        for file_name in gist_files:
+            # e.g. "task.setup.py"
+            if not (file_name.startswith("task.") and file_name.endswith(".py")):
+                continue
+
+            # e.g. "setup"
+            task_technical_name = file_name[len("task.") : -len(".py")]
+
+            # Process file content
+            file_content = gist_files[file_name]
+            meta = extract_yaml_from_python(file_content)
+            task_name = meta.get("TITLE", f"<No TITLE found at the {file_name}>")
+
+            # Update code to bypass security checks
+            file_content = convert_python_front_matter_to_comment(file_content)
+
+            # Check if code is valid
+            syntax_errors = test_python_expr(file_content, mode="exec")
+            if syntax_errors:
+                raise ValueError(
+                    f"Invalid python code at file {file_name}:\n\n{syntax_errors}"
+                )
+
+            # Check if python code has method `handle_button`
+            has_handle_button = has_function_defined(file_content, "handle_button")
+
+            task_vals = {
+                "name": task_name,
+                "code": file_content,
+                "magic_button": meta.get("MAGIC_BUTTON", "Magic ✨ Button")
+                if has_handle_button
+                else None,
+                "project_id": self.id,
+            }
+            task = self.env["sync.task"]._create_or_update_by_xmlid(
+                task_vals, task_technical_name, namespace=gist_id
+            )
+
+            def create_trigger(model, data):
+                vals = dict(
+                    {key: value for key, value in data.items() if value is not None},
+                    sync_task_id=task.id,
+                    trigger_name=data["name"],
+                )
+                return self.env[model]._create_or_update_by_xmlid(
+                    vals, data["name"], namespace=gist_id
+                )
+
+            # Create/Update triggers
+            for data in meta.get("CRON", []):
+                create_trigger("sync.trigger.cron", data)
+
+            for data in meta.get("WEBHOOK", []):
+                create_trigger("sync.trigger.webhook", data)
+
+            for data in meta.get("DB_TRIGGERS", []):
+                model_id = self.env["ir.model"]._get(data["model"]).id
+                create_trigger(
+                    "sync.trigger.automation", dict(data, model_id=model_id, model=None)
+                )
+
+        self.update(vals)
+
 
 class SyncProjectParamMixin(models.AbstractModel):
 
@@ -442,9 +571,11 @@ class SyncProjectParamMixin(models.AbstractModel):
         help="A virtual field that, during writing, stores the value in the value field, but only if it is empty. \
              It's used during module upgrade to prevent overwriting parameter values. ",
     )
+    project_id = fields.Many2one("sync.project", ondelete="cascade")
+
+    # Deprecated fields to be deleted in v17+
     description = fields.Char("Description", translate=True)
     url = fields.Char("Documentation")
-    project_id = fields.Many2one("sync.project", ondelete="cascade")
 
     _sql_constraints = [("key_uniq", "unique (project_id, key)", "Key must be unique.")]
 
@@ -491,10 +622,3 @@ class SyncProjectSecret(models.Model):
             "target": "new",
             "res_id": self.id,
         }
-
-
-# see https://stackoverflow.com/a/14620633/222675
-class AttrDict(dict):
-    def __init__(self, *args, **kwargs):
-        super(AttrDict, self).__init__(*args, **kwargs)
-        self.__dict__ = self
